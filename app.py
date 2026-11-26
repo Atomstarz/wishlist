@@ -1,65 +1,26 @@
-#!/usr/bin/env python3
-"""Вишлист: сайт на чистом Python (без внешних зависимостей).
+"""Вишлист для Vercel: Flask + Postgres.
 
-Запуск:  python3 app.py
-Сайт доступен всем устройствам в локальной сети (адрес покажется в консоли).
+Переменные окружения (задаются в настройках проекта на Vercel):
+    DATABASE_URL    строка подключения к Postgres (её выдаёт Neon / Vercel Storage)
+    EDIT_PASSWORD   пароль на изменения; смотреть список может любой
 
-Настройки через переменные окружения:
-    PORT=8080                  другой порт
-    HOST=127.0.0.1             только этот компьютер
-    EDIT_PASSWORD=секрет       смотреть могут все, а менять список -
-                               только тот, кто знает пароль
+Локальный запуск для проверки:
+    pip install -r requirements.txt
+    DATABASE_URL="postgresql://..." EDIT_PASSWORD=секрет python3 app.py
 """
 import hmac
-import json
 import os
 import re
-import socket
-import sqlite3
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
-HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", "8000"))
-EDIT_PASSWORD = os.environ.get("EDIT_PASSWORD", "")
-DB_PATH = Path(__file__).with_name("wishlist.db")
+import psycopg
+from flask import Flask, jsonify, request
+from psycopg.rows import dict_row
 
+app = Flask(__name__)
 
-def lan_ip():
-    """IP этого компьютера в локальной сети (без отправки данных наружу)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("10.255.255.255", 1))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+_schema_ready = False
 
-
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with db() as c:
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                url TEXT NOT NULL DEFAULT '',
-                price REAL,
-                note TEXT NOT NULL DEFAULT '',
-                priority INTEGER NOT NULL DEFAULT 2,
-                done INTEGER NOT NULL DEFAULT 0,
-                created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )"""
-        )
-
-
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
@@ -202,7 +163,12 @@ async function api(path, opts = {}) {
       localStorage.setItem("editPassword", entered);
       continue;
     }
-    if (!r.ok) throw new Error(await r.text());
+    if (!r.ok) {
+      let msg = "Ошибка " + r.status;
+      try { msg = (await r.json()).error || msg; } catch {}
+      alert(msg);
+      throw new Error(msg);
+    }
     return r.json();
   }
   localStorage.removeItem("editPassword");
@@ -320,119 +286,130 @@ load();
 """
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "Wishlist/1.0"
+def database_url():
+    url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or ""
+    # psycopg понимает postgresql://, но не всегда postgres://
+    return re.sub(r"^postgres://", "postgresql://", url)
 
-    # ---- helpers ----
-    def send_json(self, data, status=200):
-        body = json.dumps(data, ensure_ascii=False).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
-    def read_json(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > 100_000:
-            raise ValueError("слишком большой запрос")
-        return json.loads(self.rfile.read(length) or b"{}")
+def get_conn():
+    url = database_url()
+    if not url:
+        raise RuntimeError("не задана переменная DATABASE_URL")
+    # prepare_threshold=None нужен для пулеров соединений (Neon pooled URL)
+    return psycopg.connect(
+        url, row_factory=dict_row, connect_timeout=10, prepare_threshold=None
+    )
 
-    def authorized(self):
-        """Если пароль задан, изменения разрешены только с верным паролем."""
-        if not EDIT_PASSWORD:
-            return True
-        given = self.headers.get("X-Edit-Password", "")
-        if hmac.compare_digest(given.encode(), EDIT_PASSWORD.encode()):
-            return True
-        self.send_json({"error": "нужен пароль"}, 401)
-        return False
 
-    def item_id(self):
-        m = re.fullmatch(r"/api/items/(\d+)", self.path)
-        return int(m.group(1)) if m else None
+def ensure_schema(conn):
+    global _schema_ready
+    if _schema_ready:
+        return
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS items (
+            id BIGSERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            url TEXT NOT NULL DEFAULT '',
+            price DOUBLE PRECISION,
+            note TEXT NOT NULL DEFAULT '',
+            priority SMALLINT NOT NULL DEFAULT 2,
+            done SMALLINT NOT NULL DEFAULT 0,
+            created TIMESTAMPTZ NOT NULL DEFAULT now()
+        )"""
+    )
+    _schema_ready = True
 
-    # ---- routes ----
-    def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            body = PAGE.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path == "/api/items":
-            with db() as c:
-                rows = c.execute(
-                    "SELECT * FROM items ORDER BY done, priority DESC, id DESC"
-                ).fetchall()
-            self.send_json([dict(r) for r in rows])
-        else:
-            self.send_json({"error": "не найдено"}, 404)
 
-    def do_POST(self):
-        if self.path != "/api/items":
-            return self.send_json({"error": "не найдено"}, 404)
-        if not self.authorized():
-            return
-        try:
-            d = self.read_json()
-            title = str(d.get("title", "")).strip()[:200]
-            if not title:
-                raise ValueError("нужно название")
-            url = str(d.get("url", "")).strip()
-            if url and not re.match(r"https?://", url, re.I):
-                raise ValueError("ссылка должна начинаться с http:// или https://")
-            price = d.get("price")
-            price = float(price) if price not in (None, "") else None
-            priority = int(d.get("priority", 2))
-            if priority not in (1, 2, 3):
-                priority = 2
-            note = str(d.get("note", "")).strip()[:500]
-        except (ValueError, TypeError, json.JSONDecodeError) as e:
-            return self.send_json({"error": str(e)}, 400)
-        with db() as c:
-            cur = c.execute(
-                "INSERT INTO items (title, url, price, note, priority) VALUES (?,?,?,?,?)",
-                (title, url, price, note, priority),
-            )
-        self.send_json({"id": cur.lastrowid}, 201)
+def check_auth():
+    """Возвращает ответ с ошибкой, если менять список нельзя, иначе None."""
+    password = os.environ.get("EDIT_PASSWORD", "")
+    if not password:
+        return jsonify(error="на сервере не задан EDIT_PASSWORD"), 503
+    given = request.headers.get("X-Edit-Password", "")
+    if hmac.compare_digest(given.encode(), password.encode()):
+        return None
+    return jsonify(error="нужен пароль"), 401
 
-    def do_PATCH(self):
-        if not self.authorized():
-            return
-        iid = self.item_id()
-        if iid is None:
-            return self.send_json({"error": "не найдено"}, 404)
-        try:
-            done = 1 if self.read_json().get("done") else 0
-        except (ValueError, json.JSONDecodeError) as e:
-            return self.send_json({"error": str(e)}, 400)
-        with db() as c:
-            c.execute("UPDATE items SET done=? WHERE id=?", (done, iid))
-        self.send_json({"ok": True})
 
-    def do_DELETE(self):
-        if not self.authorized():
-            return
-        iid = self.item_id()
-        if iid is None:
-            return self.send_json({"error": "не найдено"}, 404)
-        with db() as c:
-            c.execute("DELETE FROM items WHERE id=?", (iid,))
-        self.send_json({"ok": True})
+@app.errorhandler(Exception)
+def on_error(exc):
+    app.logger.exception("ошибка запроса")
+    return jsonify(error="ошибка сервера, смотрите логи на Vercel"), 500
+
+
+@app.get("/")
+def index():
+    return PAGE, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.get("/api/items")
+def list_items():
+    with get_conn() as conn:
+        ensure_schema(conn)
+        rows = conn.execute(
+            "SELECT id, title, url, price, note, priority, done FROM items "
+            "ORDER BY done, priority DESC, id DESC"
+        ).fetchall()
+    return jsonify(rows)
+
+
+@app.post("/api/items")
+def add_item():
+    denied = check_auth()
+    if denied:
+        return denied
+    d = request.get_json(silent=True) or {}
+    try:
+        title = str(d.get("title", "")).strip()[:200]
+        if not title:
+            raise ValueError("нужно название")
+        url = str(d.get("url", "")).strip()[:2000]
+        if url and not re.match(r"https?://", url, re.I):
+            raise ValueError("ссылка должна начинаться с http:// или https://")
+        price = d.get("price")
+        price = float(price) if price not in (None, "") else None
+        if price is not None and price < 0:
+            raise ValueError("цена не может быть отрицательной")
+        priority = int(d.get("priority", 2))
+        if priority not in (1, 2, 3):
+            priority = 2
+        note = str(d.get("note", "")).strip()[:500]
+    except (ValueError, TypeError) as e:
+        return jsonify(error=str(e)), 400
+    with get_conn() as conn:
+        ensure_schema(conn)
+        row = conn.execute(
+            "INSERT INTO items (title, url, price, note, priority) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (title, url, price, note, priority),
+        ).fetchone()
+    return jsonify(id=row["id"]), 201
+
+
+@app.patch("/api/items/<int:item_id>")
+def toggle_item(item_id):
+    denied = check_auth()
+    if denied:
+        return denied
+    d = request.get_json(silent=True) or {}
+    done = 1 if d.get("done") else 0
+    with get_conn() as conn:
+        ensure_schema(conn)
+        conn.execute("UPDATE items SET done=%s WHERE id=%s", (done, item_id))
+    return jsonify(ok=True)
+
+
+@app.delete("/api/items/<int:item_id>")
+def delete_item(item_id):
+    denied = check_auth()
+    if denied:
+        return denied
+    with get_conn() as conn:
+        ensure_schema(conn)
+        conn.execute("DELETE FROM items WHERE id=%s", (item_id,))
+    return jsonify(ok=True)
 
 
 if __name__ == "__main__":
-    init_db()
-    srv = ThreadingHTTPServer((HOST, PORT), Handler)
-    print("Вишлист запущен. Остановить: Ctrl+C")
-    print(f"  на этом компьютере:  http://127.0.0.1:{PORT}")
-    if HOST in ("0.0.0.0", ""):
-        print(f"  в локальной сети:    http://{lan_ip()}:{PORT}")
-    print("  режим: " + ("смотреть всем, менять по паролю" if EDIT_PASSWORD
-                         else "менять может любой в сети (задайте EDIT_PASSWORD)"))
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print("\nОстановлено.")
+    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "8000")), debug=False)
